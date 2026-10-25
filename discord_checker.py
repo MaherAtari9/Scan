@@ -18,15 +18,25 @@ from rich.table import Table
 
 API = "https://discord.com/api/v9"
 CHARS = string.ascii_lowercase + string.digits + "_."
-DELAY = 2.0          # seconds between checks (don't lower it too much, or the account may get flagged)
+DELAY = 0.3          # seconds between checks (lower = faster, but more rate limits / ban risk)
 LOG_ROWS = 14
 
 
 def all_names():
-    names = ["".join(p) for p in itertools.product(CHARS, repeat=3)]
-    names = [n for n in names if ".." not in n]
-    random.shuffle(names)
-    return names
+    # Reads your own list from names.txt (one username per line, next to this script).
+    try:
+        with open("names.txt", encoding="utf-8") as f:
+            names = [l.strip().lower() for l in f if l.strip()]
+        names = list(dict.fromkeys(names))
+        if names:
+            return names
+    except FileNotFoundError:
+        with open("names.txt", "w", encoding="utf-8") as f:
+            f.write("abc\nxyz\n")
+        print("Created names.txt - put one username per line, then run again.")
+        raise SystemExit
+    print("names.txt is empty.")
+    raise SystemExit
 
 
 def build_ui(stats, log):
@@ -50,8 +60,9 @@ def build_ui(stats, log):
 
 
 def main():
-    token = input("Token: ").strip().strip('"').strip("'")
-    password = getpass.getpass("Account password (needed to claim): ").strip()
+    import os
+    token = (os.environ.get("DISCORD_TOKEN") or input("Token: ")).strip().strip('"').strip("'")
+    password = (os.environ.get("DISCORD_PASSWORD") or getpass.getpass("Account password (needed to claim): ")).strip()
 
     if not token:
         print("No token entered.")
@@ -130,7 +141,7 @@ def main():
                 stats["status"] = "Continuing"
 
             live.update(build_ui(stats, log))
-            time.sleep(DELAY + random.uniform(0, 0.8))
+            time.sleep(DELAY)
 
     print("Finished checking all usernames.")
 
