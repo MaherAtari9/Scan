@@ -112,7 +112,7 @@ def main():
                 live.update(build_ui(stats, log))
                 return
             if r.status_code != 200:
-                log.append((name, "[yellow]Invalid[/]"))
+                log.append((name, f"[yellow]Error {r.status_code}: {r.text[:60]}[/]"))
                 i += 1
                 stats["checked"] += 1
                 live.update(build_ui(stats, log))
