@@ -1,150 +1,175 @@
+#!/usr/bin/env python3
 """
-Discord 3-char username checker + auto-claimer
-Install:  pip install requests rich
-Run:      python discord_checker.py
+Discord username hunter - triple and semi-triple names.
+
+- No token needed: it uses Discord's public username availability endpoint,
+  so your own account is never involved.
+- Respects rate limits automatically (retry_after) and never re-checks a name.
+- Saves hits to available.txt and progress to checked.txt, so you can stop
+  the run and resume it later.
+- Sends Discord webhook alerts when the run starts and when a name is found.
+
+Usage:
+    pip install requests
+    python discord_hunter.py                 # all patterns
+    python discord_hunter.py --mode 3        # triple only
+    python discord_hunter.py --mode semi     # semi-triple only
+    python discord_hunter.py --webhook URL   # send alerts to another webhook
+    python discord_hunter.py --no-webhook    # turn alerts off
+    python discord_hunter.py --delay 1.5     # seconds between requests
 """
+import argparse
 import itertools
+import os
 import random
-import string
+import sys
 import time
-import getpass
-from collections import deque
 
 import requests
-from rich.console import Group
-from rich.live import Live
-from rich.panel import Panel
-from rich.table import Table
 
-API = "https://discord.com/api/v9"
-CHARS = string.ascii_lowercase + string.digits + "_."
-DELAY = 0.3          # seconds between checks (lower = faster, but more rate limits / ban risk)
-LOG_ROWS = 14
+URL = "https://discord.com/api/v9/unique-username/username-attempt-unauthed"
+DEFAULT_WEBHOOK = "https://discord.com/api/webhooks/1565601762692436001/LhYepWSG_Psogr-cL0UqArL_VNEWo48fAghLeNyMC3pJ-XsYSA237VScS65QAU1dtqhP"
+LETTERS = "abcdefghijklmnopqrstuvwxyz"
+DIGITS = "0123456789"
+ALNUM = LETTERS + DIGITS
+SYMBOLS = "._"
+AVAILABLE_FILE, CHECKED_FILE = "available.txt", "checked.txt"
 
 
-def all_names():
-    # Reads your own list from names.txt (one username per line, next to this script).
+def valid(name: str) -> bool:
+    """Discord rules: a-z, 0-9, _ and . only, no '..', length 2-32."""
+    return (2 <= len(name) <= 32 and ".." not in name
+            and all(c in ALNUM + SYMBOLS for c in name))
+
+
+def gen_triple():
+    """Every 3-character name: letters, digits and symbols."""
+    for t in itertools.product(ALNUM + SYMBOLS, repeat=3):
+        yield "".join(t)
+
+
+def gen_semi():
+    """Semi-triple: 4 characters built from the nice-looking patterns."""
+    for a, b, c in itertools.product(LETTERS, repeat=3):
+        yield a + b + c + a          # abca
+        yield a + a + b + b          # aabb
+        yield a + b + a + b          # abab
+        yield a + b + b + a          # abba
+        yield a + a + a + b          # aaab
+        for s in SYMBOLS:
+            yield a + s + b + c      # a.bc
+            yield a + b + s + c      # ab.c
+            yield a + b + c + s      # abc_
+            yield s + a + b + c      # _abc
+    for a, b, c in itertools.product(LETTERS, repeat=3):
+        for d in DIGITS:
+            yield a + b + c + d      # abc1
+            yield d + a + b + c      # 1abc
+
+
+def load(path):
+    """Read one name per line into a set (empty set if the file is missing)."""
+    if not os.path.exists(path):
+        return set()
+    with open(path, encoding="utf-8") as f:
+        return {line.strip() for line in f if line.strip()}
+
+
+def notify(webhook, text):
+    """Send one message to the Discord webhook. Never crashes the run."""
+    if not webhook:
+        return
     try:
-        with open("names.txt", encoding="utf-8") as f:
-            names = [l.strip().lower() for l in f if l.strip()]
-        names = list(dict.fromkeys(names))
-        if names:
-            return names
-    except FileNotFoundError:
-        with open("names.txt", "w", encoding="utf-8") as f:
-            f.write("abc\nxyz\n")
-        print("Created names.txt - put one username per line, then run again.")
-        raise SystemExit
-    print("names.txt is empty.")
-    raise SystemExit
+        r = requests.post(webhook, json={"content": text}, timeout=10)
+        if r.status_code >= 300:
+            print(f"  [webhook] Discord rejected the message (HTTP {r.status_code})")
+    except requests.RequestException as exc:
+        print(f"  [webhook] message not delivered: {exc}")
 
 
-def build_ui(stats, log):
-    head = Table.grid(padding=(0, 3))
-    head.add_row(
-        f"[bold cyan]Checked:[/] {stats['checked']}/{stats['total']}",
-        f"[bold red]Taken:[/] {stats['taken']}",
-        f"[bold green]Available:[/] {stats['free']}",
-        f"[bold yellow]Status:[/] {stats['status']}",
-    )
-    table = Table(expand=True, border_style="grey37")
-    table.add_column("#", width=6, style="dim")
-    table.add_column("Username", style="bold white")
-    table.add_column("Result")
-    for i, (name, res) in enumerate(log, start=max(1, stats["checked"] - len(log) + 1)):
-        table.add_row(str(i), name, res)
-    return Group(
-        Panel(head, title="[bold]Discord Username Checker[/]", border_style="cyan"),
-        table,
-    )
+def check(session, name):
+    """True = available, False = taken. Retries on rate limit and errors."""
+    backoff = 2
+    while True:
+        try:
+            r = session.post(URL, json={"username": name}, timeout=15)
+        except requests.RequestException:
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 60)
+            continue
+        if r.status_code == 200:
+            return not r.json().get("taken", True)
+        if r.status_code == 429:
+            try:
+                wait = float(r.json().get("retry_after", 5))
+            except Exception:
+                wait = float(r.headers.get("Retry-After", 5))
+            print(f"  [rate limit] waiting {wait:.1f}s")
+            time.sleep(wait + 0.5)
+            continue
+        if r.status_code == 400:      # name not allowed by Discord
+            return False
+        time.sleep(backoff)
+        backoff = min(backoff * 2, 60)
 
 
 def main():
-    import os
-    token = (os.environ.get("DISCORD_TOKEN") or input("Token: ")).strip().strip('"').strip("'")
-    password = (os.environ.get("DISCORD_PASSWORD") or getpass.getpass("Account password (needed to claim): ")).strip()
+    ap = argparse.ArgumentParser(description="Discord triple / semi-triple username hunter")
+    ap.add_argument("--mode", choices=["3", "semi", "all"], default="all")
+    ap.add_argument("--delay", type=float, default=1.0, help="seconds between requests")
+    ap.add_argument("--webhook", default=DEFAULT_WEBHOOK,
+                    help="Discord webhook used for alerts")
+    ap.add_argument("--no-webhook", action="store_true",
+                    help="disable webhook alerts")
+    ap.add_argument("--shuffle", action="store_true", help="check in random order")
+    args = ap.parse_args()
 
-    if not token:
-        print("No token entered.")
-        return
+    webhook = None if args.no_webhook else args.webhook
 
-    s = requests.Session()
-    s.headers.update({
-        "Authorization": token,
-        "Content-Type": "application/json",
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-        ),
-    })
+    names = []
+    if args.mode in ("3", "all"):
+        names += list(gen_triple())
+    if args.mode in ("semi", "all"):
+        names += list(gen_semi())
+    names = list(dict.fromkeys(n for n in names if valid(n)))   # drop duplicates
+    if args.shuffle:
+        random.shuffle(names)
 
-    me = s.get(f"{API}/users/@me")
-    if me.status_code != 200:
-        print(f"Login failed (HTTP {me.status_code}): {me.text[:200]}")
-        print(f"Token length received: {len(token)} (a user token is usually 70+ characters)")
-        return
-    print(f"Logged in as: {me.json().get('username')}\n")
+    checked, found = load(CHECKED_FILE), load(AVAILABLE_FILE)
+    todo = [n for n in names if n not in checked]
+    print(f"Total {len(names)} | remaining {len(todo)} | already available {len(found)}")
 
-    names = all_names()
-    stats = {"checked": 0, "taken": 0, "free": 0, "total": len(names), "status": "Checking..."}
-    log = deque(maxlen=LOG_ROWS)
+    notify(webhook, "🟢 **Username hunter started**\n"
+                    f"Mode: `{args.mode}` | names to check: `{len(todo)}` | "
+                    f"already checked: `{len(checked)}` | already found: `{len(found)}`")
 
-    with Live(build_ui(stats, log), refresh_per_second=8) as live:
-        i = 0
-        while i < len(names):
-            name = names[i]
-            try:
-                r = s.post(f"{API}/users/@me/pomelo-attempt", json={"username": name}, timeout=15)
-            except requests.RequestException:
-                stats["status"] = "Connection error, retrying"
-                live.update(build_ui(stats, log))
-                time.sleep(3)
-                continue
-
-            if r.status_code == 429:
-                wait = float(r.json().get("retry_after", 5)) + 1
-                stats["status"] = f"Rate limited, waiting {wait:.0f}s"
-                live.update(build_ui(stats, log))
-                time.sleep(wait)
-                continue
-            if r.status_code == 401:
-                stats["status"] = "Token expired"
-                live.update(build_ui(stats, log))
-                return
-            if r.status_code != 200:
-                log.append((name, f"[yellow]Error {r.status_code}: {r.text[:60]}[/]"))
-                i += 1
-                stats["checked"] += 1
-                live.update(build_ui(stats, log))
-                time.sleep(DELAY)
-                continue
-
-            taken = r.json().get("taken", True)
-            stats["checked"] += 1
-            i += 1
-
-            if taken:
-                stats["taken"] += 1
-                log.append((name, "[red]Taken[/]"))
+    session = requests.Session()
+    session.headers.update({"User-Agent": "Mozilla/5.0",
+                            "Content-Type": "application/json"})
+    with open(CHECKED_FILE, "a", encoding="utf-8") as cf, \
+         open(AVAILABLE_FILE, "a", encoding="utf-8") as af:
+        for i, name in enumerate(todo, 1):
+            ok = check(session, name)
+            cf.write(name + "\n")
+            cf.flush()
+            if ok:
+                print(f"\n[{i}/{len(todo)}] AVAILABLE: {name}")
+                af.write(name + "\n")
+                af.flush()
+                notify(webhook, f"✅ **Username available: `{name}`**\n"
+                                f"Go claim it now at Discord settings before someone else does.")
             else:
-                stats["free"] += 1
-                log.append((name, "[bold green]Available! Claiming...[/]"))
-                stats["status"] = f"Claiming {name}"
-                live.update(build_ui(stats, log))
-                c = s.patch(f"{API}/users/@me", json={"username": name, "password": password})
-                if c.status_code == 200:
-                    log.append((name, "[bold green on black]✔ Claimed on your account[/]"))
-                    stats["status"] = f"Done - {name}"
-                    live.update(build_ui(stats, log))
-                    return
-                log.append((name, f"[yellow]Claim failed ({c.status_code})[/]"))
-                stats["status"] = "Continuing"
+                print(f"[{i}/{len(todo)}] taken: {name}", end="\r")
+            time.sleep(args.delay)
 
-            live.update(build_ui(stats, log))
-            time.sleep(DELAY)
-
-    print("Finished checking all usernames.")
+    print("\nCheck finished. Results are in", AVAILABLE_FILE)
+    notify(webhook, f"🏁 **Username hunter finished** (mode `{args.mode}`) — "
+                    f"results saved in `{AVAILABLE_FILE}`")
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\nStopped - run it again and it resumes where it left off.")
+        sys.exit(0)
